@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#cdd3d6">
+  <title>Scroll Image Sequence</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #cdd3d6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: #cdd3d6;
+    }
+
+    body.is-loading {
+      overflow: hidden;
+    }
+
+    .sequence {
+      position: relative;
+      width: 100%;
+      height: calc(100svh + var(--sequence-scroll-distance, 3200px));
+      background: #cdd3d6;
+    }
+
+    .stage {
+      position: sticky;
+      top: 0;
+      width: 100%;
+      height: 100vh;
+      height: 100svh;
+      min-height: 480px;
+      overflow: hidden;
+      background: #cdd3d6;
+      isolation: isolate;
+    }
+
+    [data-parallax] {
+      will-change: transform, opacity;
+    }
+
+    [data-parallax-clip] {
+      overflow: clip;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: pan-y;
+    }
+
+    .loading {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      display: grid;
+      place-content: center;
+      justify-items: center;
+      gap: 14px;
+      background: rgba(205, 211, 214, 0.88);
+      opacity: 1;
+      transition: opacity 320ms ease, visibility 320ms ease;
+    }
+
+    .loading[hidden] {
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .loading__meter {
+      width: min(220px, 58vw);
+      height: 2px;
+      overflow: hidden;
+      background: rgba(16, 32, 38, 0.16);
+    }
+
+    .loading__bar {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: #102026;
+      transform: scaleX(0);
+      transform-origin: left center;
+      transition: transform 120ms linear;
+    }
+
+    .loading__label {
+      margin: 0;
+      color: #102026;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+    }
+
+    .scroll-cue {
+      position: absolute;
+      left: 50%;
+      bottom: max(22px, env(safe-area-inset-bottom));
+      z-index: 1;
+      width: 18px;
+      height: 18px;
+      border-right: 1.5px solid rgba(16, 32, 38, 0.72);
+      border-bottom: 1.5px solid rgba(16, 32, 38, 0.72);
+      opacity: 0;
+      transform: translateX(-50%) rotate(45deg);
+      transition: opacity 300ms ease;
+      animation: cue 1.8s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .is-ready .scroll-cue {
+      opacity: 1;
+    }
+
+    .has-scrolled .scroll-cue,
+    .is-fallback .scroll-cue {
+      opacity: 0;
+    }
+
+    .fallback-note {
+      position: absolute;
+      right: max(18px, env(safe-area-inset-right));
+      bottom: max(18px, env(safe-area-inset-bottom));
+      z-index: 3;
+      max-width: min(340px, calc(100vw - 36px));
+      margin: 0;
+      color: #28373c;
+      font-size: 12px;
+      line-height: 1.45;
+      text-align: right;
+    }
+
+    @keyframes cue {
+      0%, 100% { translate: 0 -3px; }
+      50% { translate: 0 4px; }
+    }
+
+    @media (max-width: 640px) {
+      .stage {
+        min-height: 420px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .scroll-cue {
+        animation: none;
+      }
+    }
+  </style>
+</head>
+<body class="is-loading">
+  <main>
+    <section class="sequence" aria-label="Scroll-controlled image sequence">
+      <div class="stage">
+        <canvas id="sequence-canvas" aria-label="Frame-by-frame product animation"></canvas>
+
+        <div class="loading" id="loading" role="status" aria-live="polite">
+          <div class="loading__meter" aria-hidden="true">
+            <span class="loading__bar" id="loading-bar"></span>
+          </div>
+          <p class="loading__label" id="loading-label">Loading 0%</p>
+        </div>
+
+        <span class="scroll-cue" aria-hidden="true"></span>
+        <p class="fallback-note" id="fallback-note" hidden></p>
+      </div>
+    </section>
+  </main>
+
+  <script type="module">
+    (async () => {
+      "use strict";
+
+      const FRAME_COUNT = 192;
+      const PRELOAD_CONCURRENCY = 8;
+      const motionPromise = import("https://cdn.jsdelivr.net/npm/motion@latest/+esm")
+        .catch(() => null);
+      const canvas = document.querySelector("#sequence-canvas");
+      const context = canvas.getContext("2d", { alpha: false });
+      const sequence = document.querySelector(".sequence");
+      const stage = document.querySelector(".stage");
+      const loading = document.querySelector("#loading");
+      const loadingBar = document.querySelector("#loading-bar");
+      const loadingLabel = document.querySelector("#loading-label");
+      const fallbackNote = document.querySelector("#fallback-note");
+      const frames = new Array(FRAME_COUNT);
+      const playhead = { frame: 0 };
+      let completed = 0;
+      let failed = 0;
+      let lastRenderedFrame = -1;
+      let resizeFrame = 0;
+      let sequenceScrollEnabled = false;
+
+      class LandingParallax {
+        constructor(motion, root = document) {
+          this.animate = motion.animate;
+          this.scroll = motion.scroll;
+          this.root = root;
+          this.effects = [];
+          this.motionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
+          this.handleMotionPreference = () => this.refresh();
+          this.motionPreference.addEventListener("change", this.handleMotionPreference);
+          this.refresh();
+        }
+
+        static parseRange(value, fallback = null) {
+          if (!value) return fallback;
+          const range = value.split(",").map((item) => Number(item.trim()));
+          return range.length === 2 && range.every(Number.isFinite) ? range : fallback;
+        }
+
+        static parseOffset(value) {
+          const fallback = ["start end", "end start"];
+          if (!value) return fallback;
+          const offset = value.split("|").map((item) => item.trim());
+          return offset.length === 2 && offset.every(Boolean) ? offset : fallback;
+        }
+
+        resolveTarget(element) {
+          const selector = element.dataset.parallaxTarget;
+          if (!selector) return element;
+
+          try {
+            return element.closest(selector) || this.root.querySelector(selector) || element;
+          } catch {
+            return element;
+          }
+        }
+
+        add(element) {
+          const keyframes = {
+            y: LandingParallax.parseRange(element.dataset.parallaxY, [-48, 48])
+          };
+          const optionalRanges = {
+            x: LandingParallax.parseRange(element.dataset.parallaxX),
+            scale: LandingParallax.parseRange(element.dataset.parallaxScale),
+            rotate: LandingParallax.parseRange(element.dataset.parallaxRotate),
+            opacity: LandingParallax.parseRange(element.dataset.parallaxOpacity)
+          };
+
+          Object.entries(optionalRanges).forEach(([property, range]) => {
+            if (range) keyframes[property] = range;
+          });
+
+          const animation = this.animate(element, keyframes, { ease: "linear" });
+          const stopScroll = this.scroll(animation, {
+            target: this.resolveTarget(element),
+            offset: LandingParallax.parseOffset(element.dataset.parallaxOffset),
+            trackContentSize: true
+          });
+
+          this.effects.push(() => {
+            stopScroll();
+            animation.cancel();
+          });
+        }
+
+        clear() {
+          this.effects.forEach((stop) => stop());
+          this.effects = [];
+        }
+
+        refresh() {
+          this.clear();
+          if (this.motionPreference.matches) return;
+          this.root.querySelectorAll("[data-parallax]").forEach((element) => this.add(element));
+        }
+
+        destroy() {
+          this.clear();
+          this.motionPreference.removeEventListener("change", this.handleMotionPreference);
+        }
+      }
+
+      const frameUrl = (index) => {
+        const number = String(index).padStart(3, "0");
+        const delay = index % 6 === 2 ? "0.05" : "0.04";
+        return `./ezgif-split/frame_${number}_delay-${delay}s.gif`;
+      };
+
+      function updateProgress() {
+        const percent = Math.round((completed / FRAME_COUNT) * 100);
+        loadingBar.style.transform = `scaleX(${completed / FRAME_COUNT})`;
+        loadingLabel.textContent = `Loading ${percent}%`;
+      }
+
+      function loadFrame(index) {
+        return new Promise((resolve) => {
+          const image = new Image();
+          image.decoding = "async";
+
+          image.onload = async () => {
+            try {
+              await image.decode();
+            } catch {
+              // A loaded image is still drawable if decode() is unsupported.
+            }
+
+            frames[index] = image;
+            completed += 1;
+            updateProgress();
+
+            if (index === 0) {
+              resizeCanvas();
+            }
+
+            resolve();
+          };
+
+          image.onerror = () => {
+            failed += 1;
+            completed += 1;
+            updateProgress();
+            resolve();
+          };
+
+          image.src = frameUrl(index);
+        });
+      }
+
+      async function preloadFrames() {
+        let nextIndex = 0;
+
+        async function worker() {
+          while (nextIndex < FRAME_COUNT) {
+            const index = nextIndex;
+            nextIndex += 1;
+            await loadFrame(index);
+          }
+        }
+
+        await Promise.all(
+          Array.from(
+            { length: Math.min(PRELOAD_CONCURRENCY, FRAME_COUNT) },
+            () => worker()
+          )
+        );
+      }
+
+      function closestLoadedFrame(requestedIndex) {
+        if (frames[requestedIndex]) return requestedIndex;
+
+        for (let distance = 1; distance < FRAME_COUNT; distance += 1) {
+          const before = requestedIndex - distance;
+          const after = requestedIndex + distance;
+          if (before >= 0 && frames[before]) return before;
+          if (after < FRAME_COUNT && frames[after]) return after;
+        }
+
+        return -1;
+      }
+
+      function render(requestedIndex = Math.round(playhead.frame), force = false) {
+        const frameIndex = closestLoadedFrame(requestedIndex);
+        if (frameIndex < 0 || (!force && frameIndex === lastRenderedFrame)) return;
+
+        const image = frames[frameIndex];
+        const canvasWidth = canvas.width;
+        const canvasHeight = canvas.height;
+        const scale = Math.min(canvasWidth / image.naturalWidth, canvasHeight / image.naturalHeight);
+        const drawWidth = image.naturalWidth * scale;
+        const drawHeight = image.naturalHeight * scale;
+        const x = (canvasWidth - drawWidth) / 2;
+        const y = (canvasHeight - drawHeight) / 2;
+
+        context.fillStyle = "#cdd3d6";
+        context.fillRect(0, 0, canvasWidth, canvasHeight);
+        context.drawImage(image, x, y, drawWidth, drawHeight);
+        lastRenderedFrame = frameIndex;
+      }
+
+      function resizeCanvas() {
+        cancelAnimationFrame(resizeFrame);
+        resizeFrame = requestAnimationFrame(() => {
+          const bounds = stage.getBoundingClientRect();
+          const scrollDistance = sequenceScrollEnabled
+            ? Math.max(stage.clientHeight * 5, FRAME_COUNT * 16)
+            : 0;
+          const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+          const width = Math.max(1, Math.round(bounds.width * pixelRatio));
+          const height = Math.max(1, Math.round(bounds.height * pixelRatio));
+
+          sequence.style.setProperty("--sequence-scroll-distance", `${scrollDistance}px`);
+
+          if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+            lastRenderedFrame = -1;
+          }
+
+          render(undefined, true);
+        });
+      }
+
+      function showFallback(message) {
+        document.body.classList.remove("is-loading");
+        sequence.classList.add("is-fallback");
+        sequenceScrollEnabled = false;
+        loading.hidden = true;
+        fallbackNote.textContent = message;
+        fallbackNote.hidden = false;
+        resizeCanvas();
+      }
+
+      function startSequence(motion) {
+        if (!motion?.scroll || !motion?.animate) {
+          showFallback("The still image is shown because the scroll animation could not start.");
+          return;
+        }
+
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+          showFallback("Motion is paused to honor your reduced-motion preference.");
+          return;
+        }
+
+        sequenceScrollEnabled = true;
+        sequence.style.setProperty(
+          "--sequence-scroll-distance",
+          `${Math.max(stage.clientHeight * 5, FRAME_COUNT * 16)}px`
+        );
+        resizeCanvas();
+
+        const stopSequence = motion.scroll((progress) => {
+          playhead.frame = progress * (FRAME_COUNT - 1);
+          render();
+
+          if (progress > 0.005) {
+            sequence.classList.add("has-scrolled");
+          } else {
+            sequence.classList.remove("has-scrolled");
+          }
+        }, {
+          target: sequence,
+          offset: ["start start", "end end"],
+          trackContentSize: true
+        });
+
+        window.LandingParallax = LandingParallax;
+        window.parallax = new LandingParallax(motion);
+        window.addEventListener("pagehide", () => {
+          stopSequence();
+          window.parallax.destroy();
+        }, { once: true });
+
+        document.body.classList.remove("is-loading");
+        sequence.classList.add("is-ready");
+        loading.hidden = true;
+      }
+
+      window.addEventListener("resize", resizeCanvas, { passive: true });
+      window.addEventListener("orientationchange", resizeCanvas, { passive: true });
+
+      const [, motion] = await Promise.all([preloadFrames(), motionPromise]);
+
+      if (!frames.some(Boolean)) {
+        showFallback("The image sequence could not be loaded.");
+        return;
+      }
+
+      if (failed > 0) {
+        fallbackNote.textContent = `${failed} frame${failed === 1 ? "" : "s"} could not be loaded; nearby frames will be used.`;
+        fallbackNote.hidden = false;
+      }
+
+      startSequence(motion);
+    })();
+  </script>
+</body>
+</html>
